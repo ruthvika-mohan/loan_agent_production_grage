@@ -1,8 +1,9 @@
 import json
 from typing import Annotated
 
+import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from app.config import Settings, get_settings
@@ -10,6 +11,7 @@ from app.domain.loans import loan_repository
 from app.domain.state_machine import LoanVoiceStateMachine
 from app.models import (
     AgentRequest,
+    SpeechRequest,
     ToolEmiRequest,
     ToolHumanHandoffRequest,
     ToolLoanStatusRequest,
@@ -46,17 +48,32 @@ async def conversation(request: AgentRequest) -> dict:
 @app.post("/api/voice/synthesize")
 async def synthesize(request: AgentRequest, settings: Annotated[Settings, Depends(get_settings)]) -> Response:
     response = state_machine.handle(request)
+    return await synthesize_text(SpeechRequest(text=response.text), settings)
+
+
+@app.post("/api/voice/say")
+async def synthesize_text(request: SpeechRequest, settings: Annotated[Settings, Depends(get_settings)]) -> Response:
     tts = ElevenLabsTTS(settings)
     if not tts.configured:
         return JSONResponse(
             status_code=503,
             content={
                 "error": "ElevenLabs is not configured. Set ELEVENLABS_API_KEY or use the browser speech fallback.",
-                "agent_response": response.model_dump(),
             },
         )
 
-    return StreamingResponse(tts.stream_speech(response.text), media_type="audio/mpeg")
+    try:
+        audio = await tts.synthesize_speech(request.text)
+    except httpx.HTTPStatusError as exc:
+        status_code = exc.response.status_code
+        return JSONResponse(
+            status_code=status_code,
+            content={
+                "error": f"ElevenLabs TTS request failed with status {status_code}.",
+            },
+        )
+
+    return Response(content=audio, media_type="audio/mpeg")
 
 
 def require_tool_secret(x_agent_tool_secret: str | None, settings: Settings) -> None:
@@ -128,4 +145,3 @@ async def twilio_media(websocket: WebSocket) -> None:
                 return
     except WebSocketDisconnect:
         return
-

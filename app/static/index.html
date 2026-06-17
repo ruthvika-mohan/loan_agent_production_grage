@@ -92,6 +92,12 @@
         min-height: 104px;
         resize: vertical;
       }
+      input:disabled,
+      textarea:disabled {
+        color: var(--muted);
+        background: #f0f3f1;
+        cursor: not-allowed;
+      }
       .field {
         margin-bottom: 14px;
       }
@@ -173,6 +179,21 @@
         color: var(--warn);
         font-size: 13px;
       }
+      .call-state {
+        margin-top: 12px;
+        padding: 10px 12px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        color: var(--muted);
+        background: #fff;
+        font-size: 14px;
+        font-weight: 700;
+      }
+      .call-state.active {
+        border-color: #b9d8cf;
+        color: var(--accent-strong);
+        background: #eefaf5;
+      }
       @media (max-width: 860px) {
         header,
         .grid {
@@ -209,14 +230,14 @@
             </div>
           </div>
           <div class="field">
-            <label for="utterance">Customer utterance</label>
-            <textarea id="utterance">What's the status of my loan?</textarea>
+            <label for="utterance">Live transcript</label>
+            <textarea id="utterance" disabled>Start the call, then speak naturally.</textarea>
           </div>
           <div class="actions">
-            <button id="send">Send</button>
-            <button class="secondary" id="speak">Speak</button>
-            <button class="secondary" id="stop">Stop</button>
+            <button id="startCall">Start Call</button>
+            <button class="secondary" id="endCall" disabled>End Call</button>
           </div>
+          <div class="call-state" id="callState">Call idle</div>
           <p class="hint" id="hint"></p>
         </section>
 
@@ -237,9 +258,9 @@
         loanId: document.querySelector("#loanId"),
         phoneLast4: document.querySelector("#phoneLast4"),
         utterance: document.querySelector("#utterance"),
-        send: document.querySelector("#send"),
-        speak: document.querySelector("#speak"),
-        stop: document.querySelector("#stop"),
+        startCall: document.querySelector("#startCall"),
+        endCall: document.querySelector("#endCall"),
+        callState: document.querySelector("#callState"),
         conversation: document.querySelector("#conversation"),
         latency: document.querySelector("#latency"),
         confidence: document.querySelector("#confidence"),
@@ -248,14 +269,34 @@
       };
 
       let currentAudio = null;
-      const recognition = window.SpeechRecognition || window.webkitSpeechRecognition
-        ? new (window.SpeechRecognition || window.webkitSpeechRecognition)()
-        : null;
+      let currentAudioUrl = null;
+      let callActive = false;
+      let listening = false;
+      let speaking = false;
+      let suppressRecognitionRestart = false;
+      let welcomeAudioUrl = null;
+      let welcomeAudioReady = false;
+      const welcomePrompt = (
+        "Thank you for calling the loan support desk. "
+        + "I can help with loan status, EMI details, pending documents, or connect you to a specialist. "
+        + "How can I help today?"
+      );
+      const goodbyePrompt = "Thank you for calling. Goodbye.";
+      const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      const recognition = Recognition ? new Recognition() : null;
+
+      if (recognition) {
+        recognition.lang = "en-US";
+        recognition.continuous = false;
+        recognition.interimResults = false;
+      }
 
       function addBubble(role, text) {
         const bubble = document.createElement("div");
         bubble.className = `bubble ${role}`;
-        bubble.innerHTML = `<strong>${role === "user" ? "Customer" : "Agent"}</strong>${text}`;
+        const label = document.createElement("strong");
+        label.textContent = role === "user" ? "Customer" : "Agent";
+        bubble.append(label, document.createTextNode(text));
         els.conversation.prepend(bubble);
       }
 
@@ -265,16 +306,36 @@
         els.health.textContent = data.elevenlabs_tts_configured
           ? "ElevenLabs TTS ready"
           : "Backend ready, TTS key missing";
+        if (data.elevenlabs_tts_configured) {
+          warmWelcomeAudio();
+        }
       }
 
-      async function sendUtterance(playAudio = false) {
-        els.hint.textContent = "";
-        const payload = {
-          text: els.utterance.value,
+      function setCallState(text, active = false) {
+        els.callState.textContent = text;
+        els.callState.classList.toggle("active", active);
+      }
+
+      function currentPayload(text) {
+        return {
+          text,
           loan_id: els.loanId.value || null,
           phone_last4: els.phoneLast4.value || null,
           session_id: "browser-demo",
         };
+      }
+
+      function captureLoanIdFromSpeech(text) {
+        const digits = text.replace(/\D/g, "");
+        if (!els.loanId.value && digits.length >= 5) {
+          els.loanId.value = digits.slice(0, 5);
+        }
+      }
+
+      async function sendUtterance(playAudio = false, spokenText = els.utterance.value) {
+        els.hint.textContent = "";
+        captureLoanIdFromSpeech(spokenText);
+        const payload = currentPayload(spokenText);
 
         const started = performance.now();
         const res = await fetch("/api/conversation", {
@@ -292,57 +353,270 @@
         els.handoff.textContent = data.needs_handoff ? "Yes" : "No";
 
         if (playAudio) {
-          await playElevenLabs(payload, data.text);
+          const shouldEndAfterSpeech = Boolean(data.tool_result?.end_call);
+          const shouldTransfer = Boolean(data.tool_result?.transfer);
+          await speakText(data.text, callActive && !shouldEndAfterSpeech && !shouldTransfer);
+          if (shouldTransfer) {
+            simulateTransfer(data.tool_result.queue || "loan_specialist");
+          }
+          if (shouldEndAfterSpeech) {
+            await endCall("Call ended gracefully.");
+          }
         }
       }
 
-      async function playElevenLabs(payload, fallbackText) {
-        stopAudio();
-        const res = await fetch("/api/voice/synthesize", {
+      async function playElevenLabs(payload, fallbackText, resumeAfterPlayback = false) {
+        await speakViaEndpoint("/api/voice/synthesize", payload, fallbackText, resumeAfterPlayback);
+      }
+
+      async function speakText(text, resumeAfterPlayback = false) {
+        await speakViaEndpoint("/api/voice/say", { text }, text, resumeAfterPlayback);
+      }
+
+      async function warmWelcomeAudio() {
+        if (welcomeAudioReady || welcomeAudioUrl) {
+          return;
+        }
+        const res = await fetch("/api/voice/say", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify(payload),
+          body: JSON.stringify({ text: welcomePrompt }),
+        });
+        if (!res.ok) {
+          return;
+        }
+        const blob = await res.blob();
+        welcomeAudioUrl = URL.createObjectURL(blob);
+        welcomeAudioReady = true;
+      }
+
+      async function playCachedWelcome() {
+        if (!welcomeAudioReady || !welcomeAudioUrl) {
+          await speakText(welcomePrompt, true);
+          return;
+        }
+        stopPlayback(false);
+        speaking = true;
+        setCallState("Agent is speaking", true);
+        els.hint.textContent = "Playing welcome.";
+        currentAudio = new Audio(welcomeAudioUrl);
+        currentAudio.onended = () => {
+          speaking = false;
+          currentAudio = null;
+          startListening();
+        };
+        currentAudio.onerror = () => {
+          speaking = false;
+          currentAudio = null;
+          speakText(welcomePrompt, true);
+        };
+        await currentAudio.play();
+      }
+
+      async function speakViaEndpoint(endpoint, body, fallbackText, resumeAfterPlayback = false) {
+        stopPlayback(false);
+        speaking = true;
+        els.hint.textContent = "Preparing audio...";
+        setCallState("Agent is speaking", callActive);
+        const res = await fetch(endpoint, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
         });
 
         if (!res.ok) {
-          els.hint.textContent = "ElevenLabs TTS is not configured, using browser speech for the local demo.";
+          if (!("speechSynthesis" in window)) {
+            speaking = false;
+            els.hint.textContent = "Audio playback is unavailable in this browser.";
+            return;
+          }
+          const detail = await res.json().catch(() => ({}));
+          els.hint.textContent = detail.error
+            ? `${detail.error} Using browser speech instead.`
+            : "ElevenLabs TTS is unavailable, using browser speech instead.";
           const utterance = new SpeechSynthesisUtterance(fallbackText);
           window.speechSynthesis.cancel();
-          window.speechSynthesis.speak(utterance);
+          await new Promise((resolve) => {
+            utterance.onend = () => {
+              speaking = false;
+              if (resumeAfterPlayback) {
+                startListening();
+              }
+              resolve();
+            };
+            utterance.onerror = () => {
+              speaking = false;
+              setCallState("Audio failed", callActive);
+              if (resumeAfterPlayback) {
+                startListening();
+              }
+              resolve();
+            };
+            window.speechSynthesis.speak(utterance);
+          });
           return;
         }
 
         const blob = await res.blob();
-        currentAudio = new Audio(URL.createObjectURL(blob));
+        currentAudioUrl = URL.createObjectURL(blob);
+        currentAudio = new Audio(currentAudioUrl);
+        els.hint.textContent = "Playing ElevenLabs audio.";
+        const audio = currentAudio;
+        const playbackEnded = new Promise((resolve) => {
+          audio.onended = () => {
+            speaking = false;
+            stopPlayback(false);
+            if (resumeAfterPlayback) {
+              startListening();
+            }
+            resolve();
+          };
+          audio.onerror = () => {
+            speaking = false;
+            setCallState("Audio failed", callActive);
+            if (resumeAfterPlayback) {
+              startListening();
+            }
+            resolve();
+          };
+        });
         await currentAudio.play();
+        await playbackEnded;
       }
 
-      function stopAudio() {
-        window.speechSynthesis.cancel();
+      function stopPlayback(showMessage = true) {
+        speaking = false;
+        if ("speechSynthesis" in window) {
+          window.speechSynthesis.cancel();
+        }
         if (currentAudio) {
           currentAudio.pause();
           currentAudio.currentTime = 0;
+          currentAudio = null;
+        }
+        if (currentAudioUrl) {
+          URL.revokeObjectURL(currentAudioUrl);
+          currentAudioUrl = null;
+        }
+        if (showMessage) {
+          els.hint.textContent = "Playback stopped.";
         }
       }
 
-      els.send.addEventListener("click", () => sendUtterance(false));
-      els.speak.addEventListener("click", () => {
-        if (!recognition) {
-          els.hint.textContent = "Speech recognition is not available in this browser.";
+      function startListening() {
+        if (!callActive || speaking || !recognition || listening) {
           return;
         }
-        recognition.lang = "en-US";
-        recognition.interimResults = false;
-        recognition.start();
-      });
-      els.stop.addEventListener("click", stopAudio);
+        try {
+          suppressRecognitionRestart = false;
+          recognition.start();
+          listening = true;
+          setCallState("Listening", true);
+          els.hint.textContent = "Speak now. I will respond after you pause.";
+        } catch {
+          listening = false;
+        }
+      }
+
+      function stopListening() {
+        if (!recognition || !listening) {
+          return;
+        }
+        suppressRecognitionRestart = true;
+        recognition.stop();
+        listening = false;
+      }
+
+      async function startCall() {
+        if (!recognition) {
+          els.hint.textContent = "Speech recognition is not available in this browser. Use Chrome at the localhost URL.";
+          return;
+        }
+        callActive = true;
+        els.startCall.disabled = true;
+        els.endCall.disabled = false;
+        els.loanId.disabled = true;
+        els.phoneLast4.disabled = true;
+        setCallState("Starting call", true);
+        addBubble("agent", welcomePrompt);
+        await playCachedWelcome();
+      }
+
+      function finishCall(message = "Call ended.") {
+        const finalMessage = typeof message === "string" ? message : "Call ended.";
+        callActive = false;
+        stopListening();
+        stopPlayback(false);
+        els.startCall.disabled = false;
+        els.endCall.disabled = true;
+        els.loanId.disabled = false;
+        els.phoneLast4.disabled = false;
+        setCallState("Call ended");
+        els.hint.textContent = finalMessage;
+      }
+
+      async function endCall(message = "Call ended.", speakGoodbye = false) {
+        stopListening();
+        if (speakGoodbye) {
+          addBubble("agent", goodbyePrompt);
+          await speakText(goodbyePrompt, false);
+        }
+        finishCall(message);
+      }
+
+      function simulateTransfer(queue) {
+        callActive = false;
+        stopListening();
+        els.startCall.disabled = false;
+        els.endCall.disabled = true;
+        els.loanId.disabled = false;
+        els.phoneLast4.disabled = false;
+        setCallState("Transferred to specialist");
+        els.hint.textContent = `Simulated transfer complete: ${queue}.`;
+      }
 
       if (recognition) {
         recognition.onresult = (event) => {
-          els.utterance.value = event.results[0][0].transcript;
-          sendUtterance(true);
+          const transcript = event.results[0][0].transcript.trim();
+          if (!transcript) {
+            startListening();
+            return;
+          }
+          listening = false;
+          els.utterance.value = transcript;
+          setCallState("Thinking", true);
+          sendUtterance(true, transcript).catch(() => {
+            speaking = false;
+            setCallState("Something went wrong", callActive);
+            if (callActive) {
+              startListening();
+            }
+          });
+        };
+
+        recognition.onerror = (event) => {
+          listening = false;
+          if (event.error === "no-speech" && callActive) {
+            setCallState("Listening", true);
+            startListening();
+            return;
+          }
+          els.hint.textContent = `Speech recognition error: ${event.error}.`;
+          if (callActive) {
+            window.setTimeout(startListening, 500);
+          }
+        };
+
+        recognition.onend = () => {
+          listening = false;
+          if (callActive && !speaking && !suppressRecognitionRestart) {
+            window.setTimeout(startListening, 250);
+          }
         };
       }
+
+      els.startCall.addEventListener("click", startCall);
+      els.endCall.addEventListener("click", () => endCall("Call ended by customer.", true));
 
       checkHealth().catch(() => {
         els.health.textContent = "Backend unavailable";
@@ -350,4 +624,3 @@
     </script>
   </body>
 </html>
-

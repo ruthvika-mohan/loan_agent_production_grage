@@ -18,6 +18,7 @@ class Intent(StrEnum):
     EMI_SCHEDULE = "emi_schedule"
     DOCUMENT_REQUIREMENTS = "document_requirements"
     HUMAN_HANDOFF = "human_handoff"
+    END_CALL = "end_call"
     IDENTITY_VERIFICATION = "identity_verification"
     CLARIFY = "clarify"
     UNSUPPORTED = "unsupported"
@@ -41,6 +42,10 @@ class AgentRequest(BaseModel):
     loan_id: str | None = None
     phone_last4: str | None = None
     session_id: str = "demo"
+
+
+class SpeechRequest(BaseModel):
+    text: str
 
 
 class AgentResponse(BaseModel):
@@ -67,4 +72,3 @@ class ToolVerifyIdentityRequest(BaseModel):
 class ToolHumanHandoffRequest(BaseModel):
     loan_id: str | None = None
     reason: str = "customer_requested"
-

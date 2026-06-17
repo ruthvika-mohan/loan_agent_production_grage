@@ -2,6 +2,7 @@ from app.models import Intent
 
 
 INTENT_KEYWORDS: list[tuple[Intent, tuple[str, ...]]] = [
+    (Intent.END_CALL, ("goodbye", "bye", "end call", "hang up", "that's all", "nothing else", "no thank you")),
     (Intent.HUMAN_HANDOFF, ("representative", "human", "agent", "specialist", "transfer", "call back")),
     (Intent.EMI_SCHEDULE, ("emi", "payment", "installment", "due", "payoff", "balance")),
     (Intent.DOCUMENT_REQUIREMENTS, ("document", "documents", "upload", "statement", "salary slip", "pan")),
@@ -24,4 +25,3 @@ def classify_intent(text: str) -> tuple[Intent, float]:
 
     confidence = min(0.95, 0.55 + best_score * 0.18)
     return best_intent, confidence
-

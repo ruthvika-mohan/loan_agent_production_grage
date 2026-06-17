@@ -1,5 +1,3 @@
-from collections.abc import AsyncIterator
-
 import httpx
 
 from app.config import Settings
@@ -13,7 +11,7 @@ class ElevenLabsTTS:
     def configured(self) -> bool:
         return bool(self.settings.elevenlabs_api_key)
 
-    async def stream_speech(self, text: str) -> AsyncIterator[bytes]:
+    async def synthesize_speech(self, text: str) -> bytes:
         if not self.configured:
             raise RuntimeError("ELEVENLABS_API_KEY is not configured.")
 
@@ -39,9 +37,6 @@ class ElevenLabsTTS:
         }
 
         async with httpx.AsyncClient(timeout=30) as client:
-            async with client.stream("POST", url, params=params, json=payload, headers=headers) as response:
-                response.raise_for_status()
-                async for chunk in response.aiter_bytes():
-                    if chunk:
-                        yield chunk
-
+            response = await client.post(url, params=params, json=payload, headers=headers)
+            response.raise_for_status()
+            return response.content

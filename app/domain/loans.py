@@ -30,6 +30,12 @@ class LoanRepository:
     def get(self, loan_id: str) -> LoanRecord | None:
         return self._loans.get(loan_id)
 
+    def get_by_phone_last4(self, phone_last4: str) -> LoanRecord | None:
+        matches = [loan for loan in self._loans.values() if loan.phone_last4 == phone_last4]
+        if len(matches) != 1:
+            return None
+        return matches[0]
+
     def verify_identity(self, loan_id: str, phone_last4: str) -> bool:
         loan = self.get(loan_id)
         if not loan:
@@ -66,4 +72,3 @@ class LoanRepository:
 
 
 loan_repository = LoanRepository()
-
