@@ -546,7 +546,6 @@
         const finalMessage = typeof message === "string" ? message : "Call ended.";
         callActive = false;
         stopListening();
-        stopPlayback(false);
         els.startCall.disabled = false;
         els.endCall.disabled = true;
         els.loanId.disabled = false;
@@ -561,6 +560,7 @@
           addBubble("agent", goodbyePrompt);
           await speakText(goodbyePrompt, false);
         }
+        suppressRecognitionRestart = false;
         finishCall(message);
       }
 
@@ -596,6 +596,9 @@
 
         recognition.onerror = (event) => {
           listening = false;
+          if (event.error === "aborted" && suppressRecognitionRestart) {
+            return;
+          }
           if (event.error === "no-speech" && callActive) {
             setCallState("Listening", true);
             startListening();
